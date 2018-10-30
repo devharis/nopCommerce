@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Linq;
@@ -32,7 +32,54 @@ namespace Nop.Services.Catalog
 
         #endregion
 
-        #region Product attributes
+        #region Utilities
+        
+        /// <summary>
+        /// Returns elements by binary mask.
+        ///
+        /// If binary mask in the position of element has 1 then element will be add
+        /// </summary>
+        /// <typeparam name="T">Type of element</typeparam>
+        /// <param name="elemets">Elements to make sequence</param>
+        /// <param name="forBinaryMask">Value to create binary mask</param>
+        /// <returns></returns>
+        protected virtual IList<T> GetListByBinary<T>(IList<T> elemets, int forBinaryMask)
+        {
+            var rez = new List<T>();
+            var index = -1;
+
+            //transform int to binary string
+            var binaryMask = Convert.ToString(forBinaryMask, 2).PadLeft(elemets.Count, '0');
+            
+            foreach (var flag in binaryMask)
+            {
+                index++;
+
+                if(flag == '0')
+                    continue;
+
+                //add element if binary mask in the position of element has 1
+                rez.Add(elemets[index]);
+            }
+
+            return rez;
+        }
+
+        /// <summary>
+        /// Returns a list which contains all possible combinations of elements
+        /// </summary>
+        /// <typeparam name="T">Type of element</typeparam>
+        /// <param name="elemets">Elements to make combinations</param>
+        /// <returns>All possible combinations of elements</returns>
+        protected virtual IList<IList<T>> CreateCombination<T>(IList<T> elemets)
+        {
+            var rez = new List<IList<T>>();
+
+            for (var i = 1; i < Math.Pow(2, elemets.Count); i++)
+                rez.Add(GetListByBinary(elemets, i));
+
+            return rez;
+        }
 
         /// <summary>
         /// Gets selected product attribute mapping identifiers
@@ -113,6 +160,10 @@ namespace Nop.Services.Catalog
             return selectedValues;
         }
 
+        #endregion
+
+        #region Product attributes
+       
         /// <summary>
         /// Gets selected product attribute mappings
         /// </summary>
@@ -527,32 +578,24 @@ namespace Nop.Services.Catalog
             {
                 allProductAttributMappings = allProductAttributMappings.Where(x => !x.IsNonCombinable()).ToList();
             }
-
-            var allPossibleAttributeCombinations = new List<List<ProductAttributeMapping>>();
-            for (var counter = 0; counter < (1 << allProductAttributMappings.Count); ++counter)
-            {
-                var combination = new List<ProductAttributeMapping>();
-                for (var i = 0; i < allProductAttributMappings.Count; ++i)
-                {
-                    if ((counter & (1 << i)) == 0)
-                    {
-                        combination.Add(allProductAttributMappings[i]);
-                    }
-                }
-
-                allPossibleAttributeCombinations.Add(combination);
-            }
+            
+            //get all possible attribute combinations
+            var allPossibleAttributeCombinations = CreateCombination(allProductAttributMappings);
 
             var allAttributesXml = new List<string>();
+
             foreach (var combination in allPossibleAttributeCombinations)
             {
                 var attributesXml = new List<string>();
-                foreach (var pam in combination)
+                foreach (var productAttributeMapping in combination)
                 {
-                    if (!pam.ShouldHaveValues())
+                    if (!productAttributeMapping.ShouldHaveValues())
                         continue;
 
-                    var attributeValues = _productAttributeService.GetProductAttributeValues(pam.Id);
+                    //get product attribute values
+                    var attributeValues = _productAttributeService.GetProductAttributeValues(productAttributeMapping.Id);
+                    
+                    //filter product attribute values
                     if (allowedAttributeIds?.Any() ?? false)
                     {
                         attributeValues = attributeValues.Where(attributeValue => allowedAttributeIds.Contains(attributeValue.Id)).ToList();
@@ -561,98 +604,23 @@ namespace Nop.Services.Catalog
                     if (!attributeValues.Any())
                         continue;
 
-                    //checkboxes could have several values ticked
-                    var allPossibleCheckboxCombinations = new List<List<ProductAttributeValue>>();
-                    if (pam.AttributeControlType == AttributeControlType.Checkboxes ||
-                        pam.AttributeControlType == AttributeControlType.ReadonlyCheckboxes)
+                    var isCheckbox = productAttributeMapping.AttributeControlType == AttributeControlType.Checkboxes ||
+                                     productAttributeMapping.AttributeControlType ==
+                                     AttributeControlType.ReadonlyCheckboxes;
+                    
+                    var currentAttributesXml = new List<string>();
+
+                    if (isCheckbox)
                     {
-                        for (var counter = 0; counter < (1 << attributeValues.Count); ++counter)
-                        {
-                            var checkboxCombination = new List<ProductAttributeValue>();
-                            for (var i = 0; i < attributeValues.Count; ++i)
-                            {
-                                if ((counter & (1 << i)) == 0)
-                                {
-                                    checkboxCombination.Add(attributeValues[i]);
-                                }
-                            }
-
-                            allPossibleCheckboxCombinations.Add(checkboxCombination);
-                        }
-                    }
-
-                    if (!attributesXml.Any())
-                    {
-                        //first set of values
-                        if (pam.AttributeControlType == AttributeControlType.Checkboxes ||
-                            pam.AttributeControlType == AttributeControlType.ReadonlyCheckboxes)
-                        {
-                            //checkboxes could have several values ticked
-                            foreach (var checkboxCombination in allPossibleCheckboxCombinations)
-                            {
-                                var tmp1 = string.Empty;
-                                foreach (var checkboxValue in checkboxCombination)
-                                {
-                                    tmp1 = AddProductAttribute(tmp1, pam, checkboxValue.Id.ToString());
-                                }
-
-                                if (!string.IsNullOrEmpty(tmp1))
-                                {
-                                    attributesXml.Add(tmp1);
-                                }
-                            }
-                        }
-                        else
-                        {
-                            //other attribute types (dropdownlist, radiobutton, color squares)
-                            foreach (var attributeValue in attributeValues)
-                            {
-                                var tmp1 = AddProductAttribute(string.Empty, pam, attributeValue.Id.ToString());
-                                attributesXml.Add(tmp1);
-                            }
-                        }
+                        AddSeveralValuesAttribute(productAttributeMapping, currentAttributesXml, CreateCombination(attributeValues), attributesXml);
                     }
                     else
                     {
-                        //next values. let's "append" them to already generated attribute combinations in XML format
-                        var attributesXmlTmp = new List<string>();
-                        if (pam.AttributeControlType == AttributeControlType.Checkboxes ||
-                            pam.AttributeControlType == AttributeControlType.ReadonlyCheckboxes)
-                        {
-                            //checkboxes could have several values ticked
-                            foreach (var str1 in attributesXml)
-                            {
-                                foreach (var checkboxCombination in allPossibleCheckboxCombinations)
-                                {
-                                    var tmp1 = str1;
-                                    foreach (var checkboxValue in checkboxCombination)
-                                    {
-                                        tmp1 = AddProductAttribute(tmp1, pam, checkboxValue.Id.ToString());
-                                    }
-
-                                    if (!string.IsNullOrEmpty(tmp1))
-                                    {
-                                        attributesXmlTmp.Add(tmp1);
-                                    }
-                                }
-                            }
-                        }
-                        else
-                        {
-                            //other attribute types (dropdownlist, radiobutton, color squares)
-                            foreach (var attributeValue in attributeValues)
-                            {
-                                foreach (var str1 in attributesXml)
-                                {
-                                    var tmp1 = AddProductAttribute(str1, pam, attributeValue.Id.ToString());
-                                    attributesXmlTmp.Add(tmp1);
-                                }
-                            }
-                        }
-
-                        attributesXml.Clear();
-                        attributesXml.AddRange(attributesXmlTmp);
+                        AddOneValueAttribute(productAttributeMapping, attributeValues, currentAttributesXml, attributesXml);
                     }
+
+                    attributesXml.Clear();
+                    attributesXml.AddRange(currentAttributesXml);
                 }
 
                 allAttributesXml.AddRange(attributesXml);
@@ -676,6 +644,52 @@ namespace Nop.Services.Catalog
             }
 
             return allAttributesXml;
+        }
+
+        /// <summary>
+        /// Add several values attribute types (checkboxes)
+        /// </summary>
+        /// <param name="productAttributeMapping"></param>
+        /// <param name="attributesXml"></param>
+        /// <param name="allPossibleCheckboxCombinations"></param>
+        /// <param name="oldAttributesXml"></param>
+        protected virtual void AddSeveralValuesAttribute(ProductAttributeMapping productAttributeMapping, List<string> attributesXml,
+            IList<IList<ProductAttributeValue>> allPossibleCheckboxCombinations, List<string> oldAttributesXml)
+        {
+            //checkboxes could have several values ticked
+            foreach (var oldXml in oldAttributesXml.Any() ? oldAttributesXml : new List<string> { string.Empty })
+            {
+                foreach (var checkboxCombination in allPossibleCheckboxCombinations)
+                {
+                    var newXml = oldXml;
+                    foreach (var checkboxValue in checkboxCombination)
+                    {
+                        newXml = AddProductAttribute(newXml, productAttributeMapping, checkboxValue.Id.ToString());
+                    }
+
+                    if (!string.IsNullOrEmpty(newXml))
+                    {
+                        attributesXml.Add(newXml);
+                    }
+                }
+            }
+        }
+
+        /// <summary>
+        /// Add one value attribute types (dropdownlist, radiobutton, color squares)
+        /// </summary>
+        /// <param name="productAttributeMapping"></param>
+        /// <param name="attributeValues"></param>
+        /// <param name="attributesXml"></param>
+        /// <param name="oldAttributesXml"></param>
+        protected virtual void AddOneValueAttribute(ProductAttributeMapping productAttributeMapping, IList<ProductAttributeValue> attributeValues,
+            List<string> attributesXml, List<string> oldAttributesXml)
+        {
+            foreach (var oldXml in oldAttributesXml.Any() ? oldAttributesXml : new List<string> { string.Empty })
+            {
+                attributesXml.AddRange(attributeValues.Select(attributeValue =>
+                    AddProductAttribute(oldXml, productAttributeMapping, attributeValue.Id.ToString())));
+            }
         }
 
         #endregion
