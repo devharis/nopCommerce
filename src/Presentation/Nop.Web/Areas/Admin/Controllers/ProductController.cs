@@ -5,8 +5,10 @@ using System.Linq;
 using System.Text;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.AspNetCore.Mvc.Rendering;
 using Microsoft.Extensions.Primitives;
 using Nop.Core;
+using Nop.Core.Caching;
 using Nop.Core.Domain.Catalog;
 using Nop.Core.Domain.Discounts;
 using Nop.Core.Domain.Media;
@@ -29,6 +31,7 @@ using Nop.Services.Seo;
 using Nop.Services.Shipping;
 using Nop.Services.Stores;
 using Nop.Web.Areas.Admin.Factories;
+using Nop.Web.Areas.Admin.Infrastructure.Cache;
 using Nop.Web.Areas.Admin.Infrastructure.Mapper.Extensions;
 using Nop.Web.Areas.Admin.Models.Catalog;
 using Nop.Web.Framework.Controllers;
@@ -69,6 +72,7 @@ namespace Nop.Web.Areas.Admin.Controllers
         private readonly IShippingService _shippingService;
         private readonly IShoppingCartService _shoppingCartService;
         private readonly ISpecificationAttributeService _specificationAttributeService;
+        private readonly IStaticCacheManager _cacheManager;
         private readonly IStoreMappingService _storeMappingService;
         private readonly IStoreService _storeService;
         private readonly IUrlRecordService _urlRecordService;
@@ -103,6 +107,7 @@ namespace Nop.Web.Areas.Admin.Controllers
             IProductModelFactory productModelFactory,
             IProductService productService,
             IProductTagService productTagService,
+            IStaticCacheManager cacheManager,
             ISettingService settingService,
             IShippingService shippingService,
             IShoppingCartService shoppingCartService,
@@ -141,6 +146,7 @@ namespace Nop.Web.Areas.Admin.Controllers
             this._shippingService = shippingService;
             this._shoppingCartService = shoppingCartService;
             this._specificationAttributeService = specificationAttributeService;
+            this._cacheManager = cacheManager;
             this._storeMappingService = storeMappingService;
             this._storeService = storeService;
             this._urlRecordService = urlRecordService;
@@ -1718,8 +1724,8 @@ namespace Nop.Web.Areas.Admin.Controllers
 
         #region Product specification attributes
 
-        public virtual IActionResult ProductSpecificationAttributeAdd(int attributeTypeId, int specificationAttributeOptionId,
-            string customValue, bool allowFiltering, bool showOnProductPage, int displayOrder, int productId)
+        [HttpPost, ParameterBasedOnFormName("save-continue", "continueEditing")]
+        public virtual IActionResult ProductSpecificationAttributeAdd(AddOrEditSpecificationAttribute model, bool continueEditing)
         {
             if (!_permissionService.Authorize(StandardPermissionProvider.ManageProducts))
                 return AccessDeniedView();
@@ -1727,32 +1733,32 @@ namespace Nop.Web.Areas.Admin.Controllers
             //a vendor should have access only to his products
             if (_workContext.CurrentVendor != null)
             {
-                var product = _productService.GetProductById(productId);
+                var product = _productService.GetProductById(model.ProductId);
                 if (product != null && product.VendorId != _workContext.CurrentVendor.Id)
                     return RedirectToAction("List");
             }
 
             //we allow filtering only for "Option" attribute type
-            if (attributeTypeId != (int)SpecificationAttributeType.Option)
-                allowFiltering = false;
+            if (model.AttributeTypeId != (int)SpecificationAttributeType.Option) { }
+                model.AllowFiltering = false;
 
             //we don't allow CustomValue for "Option" attribute type
-            if (attributeTypeId == (int)SpecificationAttributeType.Option)
-                customValue = null;
+            if (model.AttributeTypeId == (int)SpecificationAttributeType.Option)
+                model.ValueRaw = null;
 
-            var psa = new ProductSpecificationAttribute
-            {
-                AttributeTypeId = attributeTypeId,
-                SpecificationAttributeOptionId = specificationAttributeOptionId,
-                ProductId = productId,
-                CustomValue = customValue,
-                AllowFiltering = allowFiltering,
-                ShowOnProductPage = showOnProductPage,
-                DisplayOrder = displayOrder
-            };
+            if (model.AttributeTypeId == (int)SpecificationAttributeType.CustomText
+                || model.AttributeTypeId == (int)SpecificationAttributeType.Hyperlink)
+                model.ValueRaw = model.Value;
+
+            var psa = model.ToEntity<ProductSpecificationAttribute>();
             _specificationAttributeService.InsertProductSpecificationAttribute(psa);
 
-            return Json(new { Result = true });
+            if (continueEditing)
+                return RedirectToAction("ProductSpecAttributeAddOrEdit",
+                    new { productId = psa.ProductId, specificationId = psa.Id });
+
+            SaveSelectedTabName("tab-specification-attributes");
+            return RedirectToAction("Edit", new { id = model.ProductId });
         }
 
         [HttpPost]
@@ -1775,14 +1781,14 @@ namespace Nop.Web.Areas.Admin.Controllers
             return Json(model);
         }
 
-        [HttpPost]
-        public virtual IActionResult ProductSpecAttrUpdate(ProductSpecificationAttributeModel model)
+        [HttpPost, ParameterBasedOnFormName("save-continue", "continueEditing")]
+        public virtual IActionResult ProductSpecAttrUpdate(AddOrEditSpecificationAttribute model, bool continueEditing)
         {
             if (!_permissionService.Authorize(StandardPermissionProvider.ManageProducts))
                 return AccessDeniedView();
 
             //try to get a product specification attribute with the specified id
-            var psa = _specificationAttributeService.GetProductSpecificationAttributeById(model.Id);
+            var psa = _specificationAttributeService.GetProductSpecificationAttributeById(model.SpecificationId);
             if (psa == null)
                 return Content("No product specification attribute found with the specified id");
 
@@ -1797,27 +1803,77 @@ namespace Nop.Web.Areas.Admin.Controllers
             }
 
             //we allow filtering and change option only for "Option" attribute type
-            if (model.AttributeTypeId == (int)SpecificationAttributeType.Option)
+            switch (model.AttributeTypeId)
             {
-                psa.AllowFiltering = model.AllowFiltering;
-                psa.SpecificationAttributeOptionId = model.SpecificationAttributeOptionId;
+                case (int)SpecificationAttributeType.Option:
+                    psa.AllowFiltering = model.AllowFiltering;
+                    psa.SpecificationAttributeOptionId = model.SpecificationAttributeOptionId;
+                    break;
+                case (int)SpecificationAttributeType.CustomHtmlText:
+                    psa.CustomValue = model.ValueRaw;
+                    break;
+                default:
+                    psa.CustomValue = model.Value;
+                    break;
             }
 
             psa.ShowOnProductPage = model.ShowOnProductPage;
             psa.DisplayOrder = model.DisplayOrder;
             _specificationAttributeService.UpdateProductSpecificationAttribute(psa);
 
-            return new NullJsonResult();
+            if (continueEditing)
+            {
+                return RedirectToAction("ProductSpecAttributeAddOrEdit",
+                    new { productId = productId, specificationId = model.SpecificationId });
+            }
+
+            SaveSelectedTabName("tab-specification-attributes");
+            return RedirectToAction("Edit", new { id = productId });
+        }
+
+        public virtual IActionResult ProductSpecAttributeAddOrEdit(int productId, int? specificationId)
+        {
+            if (!_permissionService.Authorize(StandardPermissionProvider.ManageProducts))
+                return AccessDeniedView();
+
+            var model = new AddOrEditSpecificationAttribute();
+            if (specificationId.HasValue)
+            {
+                //try to get a product specification attribute with the specified id
+                try
+                {
+                    model = _productModelFactory.PrepareProductSpecificationAttributeModel(productId,
+                        specificationId.Value);
+                }
+                catch (Exception ex)
+                {
+                    _notificationService.ErrorNotification(ex);
+
+                    SaveSelectedTabName("tab-specification-attributes");
+                    return RedirectToAction("Edit", new { id = productId });
+                }
+            }
+
+            //include additional data, which is not directly related to the model 
+            ViewBag.AvailableAttributes = _cacheManager.Get(ModelCacheEventConsumer.SPEC_ATTRIBUTES_MODEL_KEY, () =>
+            {
+                return _specificationAttributeService.GetSpecificationAttributes()
+                    .Where(sa => sa.SpecificationAttributeOptions.Any())
+                    .Select(sa => new SelectListItem { Text = sa.Name, Value = sa.Id.ToString() })
+                    .ToList();
+            });
+
+            return View(model);
         }
 
         [HttpPost]
-        public virtual IActionResult ProductSpecAttrDelete(int id)
+        public virtual IActionResult ProductSpecAttrDelete(AddOrEditSpecificationAttribute model)
         {
             if (!_permissionService.Authorize(StandardPermissionProvider.ManageProducts))
                 return AccessDeniedView();
 
             //try to get a product specification attribute with the specified id
-            var psa = _specificationAttributeService.GetProductSpecificationAttributeById(id)
+            var psa = _specificationAttributeService.GetProductSpecificationAttributeById(model.SpecificationId)
                 ?? throw new ArgumentException("No specification attribute found with the specified id");
 
             var productId = psa.ProductId;
@@ -1832,7 +1888,8 @@ namespace Nop.Web.Areas.Admin.Controllers
 
             _specificationAttributeService.DeleteProductSpecificationAttribute(psa);
 
-            return new NullJsonResult();
+            SaveSelectedTabName("tab-specification-attributes");
+            return RedirectToAction("Edit", new { id = productId });
         }
 
         #endregion
